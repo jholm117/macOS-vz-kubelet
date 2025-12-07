@@ -20,6 +20,8 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
 const (
@@ -125,10 +127,26 @@ func pull(ctx context.Context, ref string, store *oci.Store, creds resource.Regi
 	// Determine if the repository is using plain HTTP based on if it's localhost or a local IP
 	repo.PlainHTTP = isLocalhostOrLocalIP(repo.Reference.Registry)
 
+	// Configure authentication with fallback chain:
+	// 1. Use credentials from imagePullSecrets if available
+	// 2. Fall back to Docker config.json (including credential helpers like ECR)
 	if !creds.IsEmpty() {
 		repo.Client = &auth.Client{
 			Credential: auth.StaticCredential(repo.Reference.Registry, toORASCredential(creds)),
 		}
+	} else {
+		// Fall back to Docker config.json with credential helper support
+		storeOpts := credentials.StoreOptions{}
+		credStore, err := credentials.NewStoreFromDocker(storeOpts)
+		if err == nil {
+			repo.Client = &auth.Client{
+				Client:     retry.DefaultClient,
+				Cache:      auth.NewCache(),
+				Credential: credentials.Credential(credStore),
+			}
+		}
+		// Note: If credStore initialization fails, we continue without authentication
+		// This allows pulling from public registries or localhost
 	}
 
 	ctx = auth.AppendRepositoryScope(ctx, repo.Reference, auth.ActionPull)
