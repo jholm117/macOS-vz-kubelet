@@ -8,6 +8,17 @@ const (
 
 	// ContainerRuntime is the runtime name for containerized workloads.
 	ContainerRuntime = "docker"
+
+	// HostProcessRuntime is the runtime name for native host processes.
+	HostProcessRuntime = "hostprocess"
+
+	// RuntimeAnnotationKey is the annotation key for specifying container runtime.
+	// Values: "vz" (default for first container), "docker" (default for other containers), "hostprocess"
+	RuntimeAnnotationKey = "vz.kubernetes.io/runtime"
+
+	// RuntimeAnnotationPrefix is the prefix for container-specific runtime annotations.
+	// Format: vz.kubernetes.io/runtime.<container-name>=<runtime>
+	RuntimeAnnotationPrefix = RuntimeAnnotationKey + "."
 )
 
 type ExecAction struct {

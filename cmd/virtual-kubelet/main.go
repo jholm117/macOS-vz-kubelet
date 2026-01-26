@@ -316,7 +316,8 @@ func run(ctx context.Context, c kubernetes.Interface) error {
 			cachePath = filepath.Join(cachePath, appIdentifier)
 
 			networkInterfaceIdentifier := os.Getenv("VZ_BRIDGE_INTERFACE")
-			vzClient := client.NewVzClientAPIs(ctx, eventRecorder, networkInterfaceIdentifier, cachePath, dockerCl)
+			cniSocketPath := os.Getenv("VZ_CNI_SOCKET_PATH")
+			vzClient := client.NewVzClientAPIs(ctx, eventRecorder, networkInterfaceIdentifier, cachePath, cniSocketPath, dockerCl)
 
 			providerConfig := provider.MacOSVZProviderConfig{
 				NodeName:           nodeName,

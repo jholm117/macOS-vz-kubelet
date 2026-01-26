@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package cni;
+
+option go_package = "github.com/agoda-com/macOS-vz-kubelet/pkg/cni/proto";
+
+// CNIService manages VPC networking for macOS VMs.
+// It assigns secondary VPC IPs to VMs and configures routing/NAT.
+service CNIService {
+    // AddNetwork assigns a VPC IP to a VM and configures routing.
+    // Called when a new VM pod is created.
+    rpc AddNetwork(AddNetworkRequest) returns (AddNetworkResponse);
+
+    // DelNetwork releases a VPC IP and removes routing configuration.
+    // Called when a VM pod is deleted.
+    rpc DelNetwork(DelNetworkRequest) returns (DelNetworkResponse);
+
+    // GetNetworkInfo returns the current network configuration for a VM.
+    rpc GetNetworkInfo(GetNetworkInfoRequest) returns (GetNetworkInfoResponse);
+}
+
+// AddNetworkRequest contains the information needed to assign networking to a VM.
+message AddNetworkRequest {
+    // Pod namespace
+    string namespace = 1;
+
+    // Pod name
+    string pod_name = 2;
+
+    // Container/VM name within the pod
+    string container_name = 3;
+
+    // Internal IP of the VM (e.g., 192.168.64.x from Virtualization.framework)
+    string vm_internal_ip = 4;
+}
+
+// AddNetworkResponse contains the assigned VPC networking information.
+message AddNetworkResponse {
+    // VPC secondary IP assigned to this VM (e.g., 10.0.x.x)
+    string vpc_ip = 1;
+
+    // Subnet mask (e.g., "255.255.252.0" or "/22")
+    string subnet_mask = 2;
+
+    // Gateway IP for the VPC subnet
+    string gateway = 3;
+
+    // Whether routing and NAT were successfully configured
+    bool routing_configured = 4;
+}
+
+// DelNetworkRequest identifies the VM whose networking should be removed.
+message DelNetworkRequest {
+    // Pod namespace
+    string namespace = 1;
+
+    // Pod name
+    string pod_name = 2;
+
+    // Container/VM name within the pod
+    string container_name = 3;
+
+    // VPC IP to release (optional, will look up if not provided)
+    string vpc_ip = 4;
+}
+
+// DelNetworkResponse confirms the network was removed.
+message DelNetworkResponse {
+    // Whether the IP was successfully released
+    bool released = 1;
+
+    // Whether routing was successfully removed
+    bool routing_removed = 2;
+}
+
+// GetNetworkInfoRequest identifies the VM to query.
+message GetNetworkInfoRequest {
+    // Pod namespace
+    string namespace = 1;
+
+    // Pod name
+    string pod_name = 2;
+
+    // Container/VM name within the pod
+    string container_name = 3;
+}
+
+// GetNetworkInfoResponse contains the current network configuration.
+message GetNetworkInfoResponse {
+    // VPC IP assigned to this VM (empty if not assigned)
+    string vpc_ip = 1;
+
+    // Internal VM IP
+    string vm_internal_ip = 2;
+
+    // Whether routing is currently configured
+    bool routing_configured = 3;
+}

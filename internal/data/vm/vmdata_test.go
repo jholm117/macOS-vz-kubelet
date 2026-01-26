@@ -145,3 +145,82 @@ func TestConcurrentAccess(t *testing.T) {
 		assert.Equal(t, fmt.Sprintf("vm%d", i), info.Ref)
 	}
 }
+
+func TestSetVPCIPAddress(t *testing.T) {
+	d := vm.VirtualMachineData{}
+	namespace := "default"
+	podName := "pod1"
+	info := vm.VirtualMachineInfo{Ref: "vm1"}
+
+	// Setting VPC IP on non-existent VM should return false
+	ok := d.SetVPCIPAddress(namespace, podName, "10.0.1.100")
+	assert.False(t, ok)
+
+	// Create the VM
+	_, loaded := d.GetOrCreateVirtualMachineInfo(namespace, podName, info)
+	assert.False(t, loaded)
+
+	// Now setting VPC IP should succeed
+	ok = d.SetVPCIPAddress(namespace, podName, "10.0.1.100")
+	assert.True(t, ok)
+
+	// Verify the VPC IP was set
+	retrievedInfo, found := d.GetVirtualMachineInfo(namespace, podName)
+	assert.True(t, found)
+	assert.Equal(t, "10.0.1.100", retrievedInfo.VPCIPAddress)
+}
+
+func TestGetVPCIPAddress(t *testing.T) {
+	d := vm.VirtualMachineData{}
+	namespace := "default"
+	podName := "pod1"
+
+	// Getting VPC IP for non-existent VM should return empty string
+	vpcIP := d.GetVPCIPAddress(namespace, podName)
+	assert.Equal(t, "", vpcIP)
+
+	// Create VM without VPC IP
+	info := vm.VirtualMachineInfo{Ref: "vm1"}
+	_, loaded := d.GetOrCreateVirtualMachineInfo(namespace, podName, info)
+	assert.False(t, loaded)
+
+	// VPC IP should be empty
+	vpcIP = d.GetVPCIPAddress(namespace, podName)
+	assert.Equal(t, "", vpcIP)
+
+	// Set VPC IP and verify
+	d.SetVPCIPAddress(namespace, podName, "10.0.1.100")
+	vpcIP = d.GetVPCIPAddress(namespace, podName)
+	assert.Equal(t, "10.0.1.100", vpcIP)
+}
+
+func TestVPCIPAddressConcurrentAccess(t *testing.T) {
+	d := vm.VirtualMachineData{}
+	namespace := "default"
+	podName := "pod1"
+	info := vm.VirtualMachineInfo{Ref: "vm1"}
+
+	// Create the VM
+	_, loaded := d.GetOrCreateVirtualMachineInfo(namespace, podName, info)
+	assert.False(t, loaded)
+
+	var wg sync.WaitGroup
+	numRoutines := 50
+
+	// Concurrent writes to VPC IP
+	for i := range numRoutines {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			vpcIP := fmt.Sprintf("10.0.1.%d", i)
+			d.SetVPCIPAddress(namespace, podName, vpcIP)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// VPC IP should be set to one of the values (last writer wins)
+	vpcIP := d.GetVPCIPAddress(namespace, podName)
+	assert.NotEmpty(t, vpcIP)
+	assert.Contains(t, vpcIP, "10.0.1.")
+}

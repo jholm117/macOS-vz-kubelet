@@ -556,6 +556,23 @@ func (c *MacOSClient) getVirtualMachineInfo(ctx context.Context, namespace, name
 	return info, nil
 }
 
+// GetVirtualMachineInfo retrieves the virtual machine information for a specific pod.
+// Returns the VirtualMachineInfo and a boolean indicating whether the VM was found.
+func (c *MacOSClient) GetVirtualMachineInfo(namespace, name string) (vmdata.VirtualMachineInfo, bool) {
+	return c.data.GetVirtualMachineInfo(namespace, name)
+}
+
+// SetVPCIPAddress sets the VPC IP address for a VM.
+// This IP will be used as the pod IP instead of the internal VM IP.
+func (c *MacOSClient) SetVPCIPAddress(namespace, name, vpcIP string) bool {
+	return c.data.SetVPCIPAddress(namespace, name, vpcIP)
+}
+
+// GetVPCIPAddress returns the VPC IP address for a VM, or empty string if not set.
+func (c *MacOSClient) GetVPCIPAddress(namespace, name string) string {
+	return c.data.GetVPCIPAddress(namespace, name)
+}
+
 // canProceedWithVirtualMachineCreation determines if it's safe to proceed with the virtual machine creation.
 // It checks whether the current number of added virtual machines has not exceeded the limit.
 func (c *MacOSClient) canProceedWithVirtualMachineCreation() bool {

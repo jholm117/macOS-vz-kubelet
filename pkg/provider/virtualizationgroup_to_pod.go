@@ -33,9 +33,17 @@ func (p *MacOSVZProvider) buildPodStatus(_ context.Context, vg *client.Virtualiz
 
 	macOSVM := vg.MacOSVirtualMachine
 	groupContainers := vg.Containers
+	groupProcesses := vg.Processes
 
-	podIp := macOSVM.IPAddress()
+	// Use VPC IP if available, otherwise fall back to internal VM IP
+	podIp := vg.VPCIPAddress
+	if podIp == "" {
+		podIp = macOSVM.IPAddress()
+	}
 	containerStatuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+
+	// Get runtime for each container from annotations
+	containerRuntimes := getContainerRuntimes(pod)
 
 	for i, c := range pod.Spec.Containers {
 		// vz: always assume that first container is macOS container
@@ -68,6 +76,48 @@ func (p *MacOSVZProvider) buildPodStatus(_ context.Context, vg *client.Virtualiz
 			continue
 		}
 
+		// Check if this container is a host process
+		runtime := containerRuntimes[c.Name]
+		if runtime == resource.HostProcessRuntime {
+			process, err := getProcessWithName(c.Name, groupProcesses)
+			if err != nil {
+				continue
+			}
+
+			state := process.State.Status
+			started := state == resource.ProcessStatusRunning
+			ready := state == resource.ProcessStatusRunning
+
+			containerStatus := corev1.ContainerStatus{
+				Name:         c.Name,
+				State:        processToContainerState(process, pod.CreationTimestamp.Time),
+				Ready:        ready,
+				Started:      &started,
+				RestartCount: 0,
+				Image:        c.Image,
+				ImageID:      "",
+				ContainerID:  utils.GetContainerID(resource.HostProcessRuntime, c.Name),
+			}
+
+			startedAt := process.State.StartedAt
+			finishedAt := process.State.FinishedAt
+			if !startedAt.IsZero() &&
+				(startedAt.Before(firstContainerStartTime) || firstContainerStartTime.IsZero()) {
+				firstContainerStartTime = startedAt
+			}
+			if startedAt.After(lastUpdateTime) {
+				lastUpdateTime = startedAt
+			}
+			if !finishedAt.IsZero() &&
+				(finishedAt.After(lastUpdateTime) || lastUpdateTime.IsZero()) {
+				lastUpdateTime = finishedAt
+			}
+
+			containerStatuses = append(containerStatuses, containerStatus)
+			continue
+		}
+
+		// Default: Docker container
 		container, err := getContainerWithName(c.Name, groupContainers)
 		if err != nil {
 			continue
@@ -278,11 +328,94 @@ func getContainerWithName(name string, list []resource.Container) (resource.Cont
 	return resource.Container{}, fmt.Errorf("container %s not found", name)
 }
 
+// getProcessWithName finds and returns a process with the specified name from a list of processes.
+func getProcessWithName(name string, list []resource.Process) (resource.Process, error) {
+	for _, p := range list {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+
+	return resource.Process{}, fmt.Errorf("process %s not found", name)
+}
+
+// getContainerRuntimes returns a map of container names to their runtime types based on pod annotations.
+func getContainerRuntimes(pod *corev1.Pod) map[string]string {
+	runtimes := make(map[string]string)
+	for i, c := range pod.Spec.Containers {
+		// First container is always macOS VM
+		if i == 0 {
+			runtimes[c.Name] = resource.MacOSRuntime
+			continue
+		}
+
+		// Check for container-specific annotation
+		annotationKey := resource.RuntimeAnnotationPrefix + c.Name
+		if runtime, ok := pod.Annotations[annotationKey]; ok {
+			runtimes[c.Name] = runtime
+		} else {
+			runtimes[c.Name] = resource.ContainerRuntime
+		}
+	}
+	return runtimes
+}
+
+// processToContainerState converts a host process state to a Kubernetes container state.
+func processToContainerState(process resource.Process, podCreationTime time.Time) corev1.ContainerState {
+	startTime := podCreationTime
+	finishTime := podCreationTime
+	if !process.State.StartedAt.IsZero() {
+		startTime = process.State.StartedAt
+	}
+	if !process.State.FinishedAt.IsZero() {
+		finishTime = process.State.FinishedAt
+	}
+
+	switch process.State.Status {
+	case resource.ProcessStatusPending:
+		return corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{
+				Reason:  "ProcessPending",
+				Message: "Host process is pending",
+			},
+		}
+	case resource.ProcessStatusRunning:
+		return corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(startTime),
+			},
+		}
+	case resource.ProcessStatusSucceeded:
+		return corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   int32(process.State.ExitCode),
+				Reason:     "Completed",
+				Message:    "Host process completed successfully",
+				StartedAt:  metav1.NewTime(startTime),
+				FinishedAt: metav1.NewTime(finishTime),
+			},
+		}
+	case resource.ProcessStatusFailed:
+		return corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   int32(process.State.ExitCode),
+				Reason:     "Error",
+				Message:    process.State.Error,
+				StartedAt:  metav1.NewTime(startTime),
+				FinishedAt: metav1.NewTime(finishTime),
+			},
+		}
+	}
+
+	return corev1.ContainerState{}
+}
+
 // getPodPhaseFromVirtualizationGroup determines the pod phase based on the state of the virtualization group.
 func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.PodPhase {
-	// Get the macOS VM and group containers
+	// Get the macOS VM, containers, and processes
 	macOSVM := vg.MacOSVirtualMachine
 	groupContainers := vg.Containers
+	groupProcesses := vg.Processes
 	hasIP := macOSVM.IPAddress() != ""
 
 	// Determine the pod phase based on the macOS VM state
@@ -294,8 +427,8 @@ func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.P
 	case resource.VirtualMachineStateFailed:
 		return corev1.PodFailed
 	case resource.VirtualMachineStateTerminating, resource.VirtualMachineStateRunning:
-		// If there are no group containers, consider VM as a single source of truth
-		if len(groupContainers) == 0 {
+		// If there are no group containers or processes, consider VM as a single source of truth
+		if len(groupContainers) == 0 && len(groupProcesses) == 0 {
 			if !hasIP {
 				return corev1.PodPending
 			}
@@ -304,7 +437,7 @@ func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.P
 	}
 
 	// Determine the pod phase based on the container statuses
-	allContainersRunning := true
+	allRunning := true
 	for _, container := range groupContainers {
 		switch container.State.Status {
 		case resource.ContainerStatusWaiting, resource.ContainerStatusCreated:
@@ -314,7 +447,21 @@ func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.P
 		case resource.ContainerStatusOOMKilled, resource.ContainerStatusUnknown:
 			return corev1.PodFailed
 		default:
-			allContainersRunning = false
+			allRunning = false
+		}
+	}
+
+	// Determine the pod phase based on the process statuses
+	for _, process := range groupProcesses {
+		switch process.State.Status {
+		case resource.ProcessStatusPending:
+			return corev1.PodPending
+		case resource.ProcessStatusRunning:
+			// Continue checking other processes
+		case resource.ProcessStatusFailed:
+			return corev1.PodFailed
+		case resource.ProcessStatusSucceeded:
+			allRunning = false
 		}
 	}
 
@@ -322,7 +469,7 @@ func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.P
 		return corev1.PodPending
 	}
 
-	if allContainersRunning {
+	if allRunning {
 		return corev1.PodRunning
 	}
 
@@ -331,9 +478,10 @@ func getPodPhaseFromVirtualizationGroup(vg *client.VirtualizationGroup) corev1.P
 
 // getPodConditionsFromVirtualizationGroup determines the pod conditions based on the state of the virtualization group.
 func getPodConditionsFromVirtualizationGroup(vg *client.VirtualizationGroup, podCreationTime, firstContainerStartTime, lastUpdateTime time.Time) []corev1.PodCondition {
-	// Get the macOS VM and group containers
+	// Get the macOS VM, containers, and processes
 	macOSVM := vg.MacOSVirtualMachine
 	groupContainers := vg.Containers
+	groupProcesses := vg.Processes
 
 	// Initialize pod conditions
 	conditions := []corev1.PodCondition{}
@@ -376,7 +524,7 @@ func getPodConditionsFromVirtualizationGroup(vg *client.VirtualizationGroup, pod
 		readyCondition.Status = corev1.ConditionFalse
 	case resource.VirtualMachineStateTerminating, resource.VirtualMachineStateRunning:
 		// Check container states
-		allContainersRunning := true
+		allRunning := true
 		for _, container := range groupContainers {
 			switch container.State.Status {
 			case resource.ContainerStatusWaiting, resource.ContainerStatusCreated:
@@ -389,13 +537,32 @@ func getPodConditionsFromVirtualizationGroup(vg *client.VirtualizationGroup, pod
 				// Pod is not initialized and not ready
 				initializedCondition.Status = corev1.ConditionFalse
 				readyCondition.Status = corev1.ConditionFalse
-				allContainersRunning = false
+				allRunning = false
 			default:
-				allContainersRunning = false
+				allRunning = false
 			}
 		}
 
-		if allContainersRunning {
+		// Check process states
+		for _, process := range groupProcesses {
+			switch process.State.Status {
+			case resource.ProcessStatusPending:
+				// Pod is not yet initialized or ready
+				initializedCondition.Status = corev1.ConditionFalse
+				readyCondition.Status = corev1.ConditionFalse
+			case resource.ProcessStatusRunning:
+				// Continue checking other processes
+			case resource.ProcessStatusFailed:
+				// Pod is not initialized and not ready
+				initializedCondition.Status = corev1.ConditionFalse
+				readyCondition.Status = corev1.ConditionFalse
+				allRunning = false
+			case resource.ProcessStatusSucceeded:
+				allRunning = false
+			}
+		}
+
+		if allRunning {
 			// Pod is initialized and ready
 			initializedCondition.Status = corev1.ConditionTrue
 			readyCondition.Status = corev1.ConditionTrue

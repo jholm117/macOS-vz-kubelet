@@ -13,10 +13,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// VirtualizationGroup represents a group of macOS virtual machines and containers.
+// VirtualizationGroup represents a group of macOS virtual machines, containers, and host processes.
 type VirtualizationGroup struct {
 	MacOSVirtualMachine resource.VirtualMachine
 	Containers          []resource.Container
+	Processes           []resource.Process
+	// VPCIPAddress is the VPC secondary IP assigned by the CNI agent.
+	// If set, this should be used as the pod IP instead of the VM's internal IP.
+	VPCIPAddress string
 }
 
 // VzClientInterface defines the methods that a VzClient implementation should provide.

@@ -1,57 +1,145 @@
-require 'shellwords'
+# Fastfile - Fastlane automation for macOS-vz-kubelet certificate management
+# https://docs.fastlane.tools
 
 default_platform(:mac)
 
-platform :mac do
-  desc "Builds and signs the macOS application using the Developer ID certificate and provisioning profile obtained from match."
-  lane :build_snapshot do
-    match(
-      app_identifier: 'com.agoda.fleet.virtualization',
-      type: 'developer_id',
-      verbose: true
-    )
-    build_and_sign_macos_app('snapshot')
+# Workaround for fastlane bug: G2 certificate type not supported by App Store Connect API
+# when creating new certificates. This patch forces the non-G2 type.
+# See: https://github.com/fastlane/fastlane/issues/29538
+def apply_g2_certificate_patch
+  return if @g2_patch_applied
+
+  # Load the cert module
+  require 'cert'
+  require 'spaceship'
+
+  # Directly redefine the method on the class
+  ::Cert::Runner.class_eval do
+    alias_method :original_certificate_types, :certificate_types
+
+    define_method(:certificate_types) do
+      cert_type = ::Cert.config[:type]&.to_s
+      UI.message("G2 Patch: cert_type = #{cert_type.inspect}")
+      # Handle all developer_id type variations
+      if cert_type&.include?("developer_id_application") || cert_type&.include?("developer_id")
+        UI.message("G2 Patch: Forcing DEVELOPER_ID_APPLICATION (non-G2)")
+        return [::Spaceship::ConnectAPI::Certificate::CertificateType::DEVELOPER_ID_APPLICATION]
+      end
+      original_certificate_types
+    end
   end
 
-  desc "Builds, signs, and releases the macOS application using the Developer ID certificate and provisioning profile obtained from match."
-  lane :build_release do
-    match(
-      app_identifier: 'com.agoda.fleet.virtualization',
-      type: 'developer_id',
-      verbose: true
-    )
-    build_and_sign_macos_app('release')
-  end
+  @g2_patch_applied = true
+  UI.message("Applied G2 certificate type workaround")
 end
 
-def build_and_sign_macos_app(target)
-  Fastlane::Actions.execute_action("Build and sign macOS app") do
-    # Retrieve the necessary environment variables set by match
-    release_certificate_name = ENV['sigh_com.agoda.fleet.virtualization_developer_id_macos_certificate-name']
-    release_provision_profile_path = ENV['sigh_com.agoda.fleet.virtualization_developer_id_macos_profile-path']
-
-    # Log the start of the build process
-    Fastlane::UI.message("Starting the build process for #{target}...")
-
-    # Change directory
-    Fastlane::UI.message("Changing directory to project root...")
-    Dir.chdir("..") do
-      # Set environment variables
-      Fastlane::UI.message("Setting environment variables...")
-      ENV['RELEASE_CERTIFICATE_NAME'] = Shellwords.escape(release_certificate_name)
-      ENV['RELEASE_PROVISION_PROFILE_PATH'] = Shellwords.escape(release_provision_profile_path)
-
-      # Log the environment variables being used
-      Fastlane::UI.message("Using certificate: #{release_certificate_name}")
-      Fastlane::UI.message("Using provisioning profile: #{release_provision_profile_path}")
-
-      # Call the appropriate make command based on the target
-      make_command = target == 'release' ? 'make release' : 'make snapshot'
-      Fastlane::UI.message("Running #{make_command} command...")
-      sh(make_command)
+platform :mac do
+  desc "Fetch (or create) Developer ID certificate and provisioning profile"
+  lane :fetch_signing do
+    # Set up keychain for CI builds
+    if ENV["CI"] || ENV["PACKER_BUILD"]
+      setup_ci_keychain
     end
 
-    # Log the completion of the build process
-    Fastlane::UI.message("#{target.capitalize} process completed.")
+    # Fetch or create Developer ID certificate and profile
+    match(
+      type: "developer_id",
+      platform: "macos",
+      app_identifier: "com.scaleai.kubelet",
+      readonly: is_ci,
+      force_for_new_devices: false,
+      verbose: true
+    )
+
+    # Export environment variables for the build script
+    export_signing_env
+  end
+
+  desc "Create new Developer ID certificate (run once, then use fetch_signing)"
+  lane :create_signing do
+    # Apply the G2 certificate type workaround
+    apply_g2_certificate_patch
+
+    # NOTE: Developer ID certificates can ONLY be created using Apple ID
+    # username/password authentication (not API keys). This is an Apple restriction.
+    # The script sets FASTLANE_USER, FASTLANE_PASSWORD, and runs spaceauth
+    # to generate FASTLANE_SESSION before calling this lane.
+
+    # Accept configuration from environment variables
+    s3_bucket = ENV["MATCH_S3_BUCKET"]
+    s3_region = ENV["AWS_REGION"] || ENV["AWS_DEFAULT_REGION"]
+    team_id = ENV["APPLE_TEAM_ID"] || "L22TQ79CXK"
+    username = ENV["FASTLANE_USER"]
+
+    UI.user_error!("FASTLANE_USER not set - Apple ID required for Developer ID certs") unless username
+
+    match_params = {
+      type: "developer_id",
+      platform: "macos",
+      app_identifier: "com.scaleai.kubelet",
+      team_id: team_id,
+      username: username,
+      readonly: false,
+      force: true,
+      verbose: true
+    }
+
+    # Add S3 config if provided
+    if s3_bucket
+      match_params[:storage_mode] = "s3"
+      match_params[:s3_bucket] = s3_bucket
+      match_params[:s3_region] = s3_region if s3_region
+    end
+
+    match(match_params)
+  end
+
+  desc "Nuke and recreate all certificates (use with caution)"
+  lane :nuke_signing do
+    match_nuke(type: "developer_id", platform: "macos")
+    create_signing
+  end
+
+  # Private helper lanes
+  private_lane :setup_ci_keychain do
+    keychain_name = ENV["KEYCHAIN_NAME"] || "build.keychain"
+    keychain_password = ENV["KEYCHAIN_PASSWORD"] || "build-#{Time.now.to_i}"
+
+    # Create temporary keychain
+    create_keychain(
+      name: keychain_name,
+      password: keychain_password,
+      default_keychain: false,
+      unlock: true,
+      timeout: 7200,
+      lock_when_sleeps: false,
+      lock_after_timeout: false
+    )
+
+    # Store for later use
+    ENV["KEYCHAIN_NAME"] = keychain_name
+    ENV["KEYCHAIN_PASSWORD"] = keychain_password
+  end
+
+  private_lane :export_signing_env do
+    # Write signing environment for build scripts
+    signing_env_file = "/tmp/signing-env.sh"
+
+    # Get the signing identity from the keychain
+    keychain = ENV["KEYCHAIN_NAME"] || "login.keychain"
+
+    File.open(signing_env_file, "w") do |f|
+      f.puts "# Signing environment generated by fastlane"
+      f.puts "export CODESIGN_IDENTITY=\"#{ENV['sigh_developer_id_macos_signing_identity'] || 'Developer ID Application'}\""
+      f.puts "export KEYCHAIN_NAME=\"#{keychain}\""
+      f.puts "export KEYCHAIN_PASSWORD=\"#{ENV['KEYCHAIN_PASSWORD']}\""
+      f.puts "export TEAM_ID=\"#{ENV['APPLE_TEAM_ID'] || 'L22TQ79CXK'}\""
+    end
+
+    UI.success("Signing environment exported to #{signing_env_file}")
+  end
+
+  private_lane :is_ci do
+    ENV["CI"] || ENV["PACKER_BUILD"] ? true : false
   end
 end

@@ -11,4 +11,8 @@ type VirtualMachineInfo struct {
 	Ref                string
 	Resource           resource.MacOSVirtualMachine
 	DownloadCancelFunc context.CancelFunc
+
+	// VPCIPAddress is the VPC secondary IP assigned by the CNI agent.
+	// If set, this should be used as the pod IP instead of the internal VM IP.
+	VPCIPAddress string
 }

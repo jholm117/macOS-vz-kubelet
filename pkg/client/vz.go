@@ -13,6 +13,7 @@ import (
 
 	"github.com/agoda-com/macOS-vz-kubelet/internal/utils"
 	"github.com/agoda-com/macOS-vz-kubelet/internal/volumes"
+	"github.com/agoda-com/macOS-vz-kubelet/pkg/cni"
 	"github.com/agoda-com/macOS-vz-kubelet/pkg/event"
 	"github.com/agoda-com/macOS-vz-kubelet/pkg/resource"
 	rm "github.com/agoda-com/macOS-vz-kubelet/pkg/resourcemanager"
@@ -58,15 +59,17 @@ type virtualizationGroupExtras struct {
 
 // VzClientAPIs is a concrete implementation of VzClientInterface, using MacOSClient and ContainerClient.
 type VzClientAPIs struct {
-	MacOSClient     *rm.MacOSClient
-	ContainerClient rm.ContainersClient // Optional
+	MacOSClient        *rm.MacOSClient
+	ContainerClient    rm.ContainersClient    // Optional
+	HostProcessClient  rm.HostProcessClient   // Optional
+	CNIClient          *cni.Client            // Optional - for VPC networking
 
 	cachePath string
 	extras    sync.Map // map[types.NamespacedName]*virtualizationGroupExtras
 }
 
 // NewVzClientAPIs initializes and returns a new VzClientAPIs instance.
-func NewVzClientAPIs(ctx context.Context, eventRecorder event.EventRecorder, networkInterfaceIdentifier, cachePath string, dockerCl *docker.Client) (client *VzClientAPIs) {
+func NewVzClientAPIs(ctx context.Context, eventRecorder event.EventRecorder, networkInterfaceIdentifier, cachePath, cniSocketPath string, dockerCl *docker.Client) (client *VzClientAPIs) {
 	ctx, span := trace.StartSpan(ctx, "VZClient.NewVzClientAPIs")
 	defer span.End()
 
@@ -84,6 +87,27 @@ func NewVzClientAPIs(ctx context.Context, eventRecorder event.EventRecorder, net
 	}
 	if containerClient != nil {
 		client.ContainerClient = containerClient
+	}
+
+	hostProcessClient, err := rm.NewHostProcessClient(ctx)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to create host process client")
+	}
+	if hostProcessClient != nil {
+		client.HostProcessClient = hostProcessClient
+	}
+
+	// Initialize CNI client if socket path is provided and available
+	if cniSocketPath != "" && cni.IsAvailable(cniSocketPath) {
+		cniClient, err := cni.NewClient(cniSocketPath)
+		if err != nil {
+			log.G(ctx).WithError(err).Warn("Failed to create CNI client")
+		} else {
+			client.CNIClient = cniClient
+			log.G(ctx).Infof("CNI client connected to %s", cniSocketPath)
+		}
+	} else if cniSocketPath != "" {
+		log.G(ctx).Warnf("CNI socket %s not available, VM pods will use internal IPs", cniSocketPath)
 	}
 
 	return client
@@ -166,7 +190,7 @@ func (c *VzClientAPIs) CreateVirtualizationGroup(ctx context.Context, pod *corev
 			}
 		}
 
-		return c.MacOSClient.CreateVirtualMachine(ctx, rm.VirtualMachineParams{
+		err = c.MacOSClient.CreateVirtualMachine(ctx, rm.VirtualMachineParams{
 			UID:              string(pod.UID),
 			Image:            image,
 			Namespace:        pod.Namespace,
@@ -180,11 +204,61 @@ func (c *VzClientAPIs) CreateVirtualizationGroup(ctx context.Context, pod *corev
 			IgnoreImageCache: pullPolicy == corev1.PullAlways,
 			RegistryCreds:    vmCreds,
 		})
+		if err != nil {
+			return err
+		}
+
+		// If CNI client is available, request a VPC IP for the VM
+		if c.CNIClient != nil {
+			vmInfo, ok := c.MacOSClient.GetVirtualMachineInfo(pod.Namespace, pod.Name)
+			if ok && vmInfo.Resource.IPAddress() != "" {
+				networkInfo, cniErr := c.CNIClient.AddNetwork(ctx, pod.Namespace, pod.Name, macOSContainer.Name, vmInfo.Resource.IPAddress())
+				if cniErr != nil {
+					log.G(ctx).WithError(cniErr).Warn("Failed to configure VPC networking, pod will use internal IP")
+				} else {
+					// Store the VPC IP in the VM info
+					c.MacOSClient.SetVPCIPAddress(pod.Namespace, pod.Name, networkInfo.VPCIP)
+					log.G(ctx).Infof("VPC IP assigned: %s -> %s", vmInfo.Resource.IPAddress(), networkInfo.VPCIP)
+				}
+			}
+		}
+
+		return nil
 	})
 
 	for i := 1; i < len(pod.Spec.Containers); i++ {
 		container := pod.Spec.Containers[i]
+		containerIndex := i
 		g.Go(func() error {
+			runtime := getContainerRuntime(pod, container.Name, containerIndex)
+
+			// Handle host process runtime
+			if runtime == resource.HostProcessRuntime {
+				if c.HostProcessClient == nil {
+					return errdefs.InvalidInput("host process runtime is not available")
+				}
+
+				mounts, err := volumes.CreateContainerMounts(ctx, extras.rootDir, container, pod, serviceAccountToken, configMaps)
+				if err != nil {
+					return err
+				}
+
+				return c.HostProcessClient.CreateProcess(
+					ctx,
+					rm.HostProcessParams{
+						PodNamespace: pod.Namespace,
+						PodName:      pod.Name,
+						Name:         container.Name,
+						Command:      container.Command,
+						Args:         container.Args,
+						Env:          container.Env,
+						WorkingDir:   container.WorkingDir,
+						Mounts:       mounts,
+					},
+				)
+			}
+
+			// Default: Docker container runtime
 			containerCreds, _ := creds.ForImage(container.Image)
 
 			mounts, err := volumes.CreateContainerMounts(ctx, extras.rootDir, container, pod, serviceAccountToken, configMaps)
@@ -266,7 +340,7 @@ func (c *VzClientAPIs) DeleteVirtualizationGroup(ctx context.Context, namespace,
 		}()
 
 		var wg sync.WaitGroup
-		var vmErr, containerErr error
+		var vmErr, containerErr, hostProcessErr error
 
 		// Delete virtual machine
 		wg.Add(1)
@@ -284,15 +358,47 @@ func (c *VzClientAPIs) DeleteVirtualizationGroup(ctx context.Context, namespace,
 			}()
 		}
 
-		wg.Wait() // Wait for both operations to complete
+		// Delete host processes
+		if c.HostProcessClient != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				hostProcessErr = c.HostProcessClient.RemoveProcesses(ctx, namespace, name, gracePeriod)
+			}()
+		}
+
+		// Release VPC IP if CNI client is available
+		if c.CNIClient != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Use empty container name - the CNI server tracks by namespace/podName
+				if err := c.CNIClient.DelNetwork(ctx, namespace, name, ""); err != nil {
+					log.G(ctx).WithError(err).Warn("Failed to release VPC IP")
+				}
+			}()
+		}
+
+		wg.Wait() // Wait for all operations to complete
+
+		// Combine errors (excluding CNI errors which are non-fatal warnings)
+		allErrs := []error{vmErr, containerErr, hostProcessErr}
+		var nonNilErrs []error
+		allNotFound := true
+		for _, e := range allErrs {
+			if e != nil {
+				nonNilErrs = append(nonNilErrs, e)
+				if !errdefs.IsNotFound(e) {
+					allNotFound = false
+				}
+			}
+		}
 
 		switch {
-		case vmErr != nil && containerErr != nil:
-			if errdefs.IsNotFound(vmErr) && errdefs.IsNotFound(containerErr) {
-				extras.deleteDone <- errVirtualizationGroupNotFound
-			} else {
-				extras.deleteDone <- errors.Join(vmErr, containerErr)
-			}
+		case len(nonNilErrs) == len(allErrs) && allNotFound:
+			extras.deleteDone <- errVirtualizationGroupNotFound
+		case len(nonNilErrs) > 0 && !allNotFound:
+			extras.deleteDone <- errors.Join(nonNilErrs...)
 		case vmErr != nil:
 			if errdefs.IsNotFound(vmErr) {
 				extras.deleteDone <- nil
@@ -327,8 +433,9 @@ func (c *VzClientAPIs) GetVirtualizationGroup(ctx context.Context, namespace, na
 	}()
 
 	var containers []resource.Container
+	var processes []resource.Process
 	var vm resource.MacOSVirtualMachine
-	var containerErr, vmErr error
+	var containerErr, vmErr, processErr error
 
 	// Fetch containers
 	if c.ContainerClient != nil {
@@ -338,6 +445,18 @@ func (c *VzClientAPIs) GetVirtualizationGroup(ctx context.Context, namespace, na
 		}
 	} else {
 		containerErr = errdefs.NotFound("container client not available")
+	}
+
+	// Fetch host processes
+	if c.HostProcessClient != nil {
+		processes, processErr = c.HostProcessClient.GetProcesses(ctx, namespace, name)
+		if processErr != nil && !errdefs.IsNotFound(processErr) {
+			if err != nil {
+				err = errors.Join(err, processErr)
+			} else {
+				err = processErr
+			}
+		}
 	}
 
 	// Fetch virtual machine
@@ -350,23 +469,22 @@ func (c *VzClientAPIs) GetVirtualizationGroup(ctx context.Context, namespace, na
 		}
 	}
 
-	// If both clients return not found errors, return a combined not found error
-	if errdefs.IsNotFound(containerErr) && errdefs.IsNotFound(vmErr) {
+	// If all clients return not found errors, return a combined not found error
+	allNotFound := errdefs.IsNotFound(containerErr) && errdefs.IsNotFound(vmErr) &&
+		(c.HostProcessClient == nil || errdefs.IsNotFound(processErr) || processErr == nil && len(processes) == 0)
+	if allNotFound {
 		return nil, errVirtualizationGroupNotFound
 	}
 
-	// If both clients return errors, combine them
-	if containerErr != nil && vmErr != nil {
-		return &VirtualizationGroup{
-			Containers:          containers,
-			MacOSVirtualMachine: &vm,
-		}, errors.Join(containerErr, vmErr)
-	}
+	// Get VPC IP if available
+	vpcIP := c.MacOSClient.GetVPCIPAddress(namespace, name)
 
 	// Return the virtualization group with any existing values
 	return &VirtualizationGroup{
 		Containers:          containers,
+		Processes:           processes,
 		MacOSVirtualMachine: &vm,
+		VPCIPAddress:        vpcIP,
 	}, err
 }
 
@@ -380,9 +498,10 @@ func (c *VzClientAPIs) GetVirtualizationGroupListResult(ctx context.Context) (l 
 	logger := log.G(ctx)
 
 	var wg sync.WaitGroup
-	var vmErr, containerErr error
+	var vmErr, containerErr, processErr error
 	var vms map[types.NamespacedName]resource.MacOSVirtualMachine
 	var containers map[types.NamespacedName][]resource.Container
+	var processes map[types.NamespacedName][]resource.Process
 
 	// Fetch virtual machines
 	wg.Add(1)
@@ -406,15 +525,33 @@ func (c *VzClientAPIs) GetVirtualizationGroupListResult(ctx context.Context) (l 
 		}()
 	}
 
+	// Fetch host processes
+	if c.HostProcessClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processes, processErr = c.HostProcessClient.GetProcessesListResult(ctx)
+			if processErr != nil {
+				logger.WithError(processErr).Warn("Error getting host process list")
+			}
+		}()
+	}
+
 	wg.Wait()
 
-	// Combine errors if both exist
-	if vmErr != nil && containerErr != nil {
-		err = errors.Join(vmErr, containerErr)
-	} else if vmErr != nil {
-		err = vmErr
-	} else if containerErr != nil {
-		err = containerErr
+	// Combine errors
+	var errs []error
+	if vmErr != nil {
+		errs = append(errs, vmErr)
+	}
+	if containerErr != nil {
+		errs = append(errs, containerErr)
+	}
+	if processErr != nil {
+		errs = append(errs, processErr)
+	}
+	if len(errs) > 0 {
+		err = errors.Join(errs...)
 	}
 
 	// Initialize the result map
@@ -422,8 +559,10 @@ func (c *VzClientAPIs) GetVirtualizationGroupListResult(ctx context.Context) (l 
 
 	// Combine the results
 	for k, v := range vms {
+		vpcIP := c.MacOSClient.GetVPCIPAddress(k.Namespace, k.Name)
 		l[k] = &VirtualizationGroup{
 			MacOSVirtualMachine: &v,
+			VPCIPAddress:        vpcIP,
 		}
 	}
 
@@ -433,6 +572,16 @@ func (c *VzClientAPIs) GetVirtualizationGroupListResult(ctx context.Context) (l 
 		} else {
 			l[k] = &VirtualizationGroup{
 				Containers: c,
+			}
+		}
+	}
+
+	for k, p := range processes {
+		if vg, exists := l[k]; exists {
+			vg.Processes = p
+		} else {
+			l[k] = &VirtualizationGroup{
+				Processes: p,
 			}
 		}
 	}
@@ -448,6 +597,12 @@ func (c *VzClientAPIs) GetContainerLogs(ctx context.Context, namespace, podName,
 		span.End()
 	}()
 
+	// Check host processes first
+	if c.HostProcessClient != nil && c.HostProcessClient.IsProcessPresent(ctx, namespace, podName, containerName) {
+		return c.HostProcessClient.GetProcessLogs(ctx, namespace, podName, containerName, opts)
+	}
+
+	// Check containers
 	if c.ContainerClient != nil && c.ContainerClient.IsContainerPresent(ctx, namespace, podName, containerName) {
 		return c.ContainerClient.GetContainerLogs(ctx, namespace, podName, containerName, opts)
 	}
@@ -463,6 +618,12 @@ func (c *VzClientAPIs) ExecuteContainerCommand(ctx context.Context, namespace, p
 		span.End()
 	}()
 
+	// Check host processes first
+	if c.HostProcessClient != nil && c.HostProcessClient.IsProcessPresent(ctx, namespace, podName, containerName) {
+		return c.HostProcessClient.ExecInProcess(ctx, namespace, podName, containerName, cmd, attach)
+	}
+
+	// Check containers
 	if c.ContainerClient != nil && c.ContainerClient.IsContainerPresent(ctx, namespace, podName, containerName) {
 		return c.ContainerClient.ExecInContainer(ctx, namespace, podName, containerName, cmd, attach)
 	}
@@ -515,4 +676,22 @@ func (c *VzClientAPIs) GetVirtualizationGroupStats(ctx context.Context, namespac
 // getPodVolumeRoot returns the root path for the volumes of a pod
 func (c *VzClientAPIs) getPodVolumeRoot(pod *corev1.Pod) string {
 	return filepath.Join(c.cachePath, PodMountsDir, string(pod.UID))
+}
+
+// getContainerRuntime determines the runtime for a container based on pod annotations.
+// For the first container (index 0), default is MacOSRuntime ("vz").
+// For other containers, default is ContainerRuntime ("docker").
+// Runtime can be overridden via annotation: vz.kubernetes.io/runtime.<container-name>=<runtime>
+func getContainerRuntime(pod *corev1.Pod, containerName string, containerIndex int) string {
+	// Check for container-specific annotation
+	annotationKey := resource.RuntimeAnnotationPrefix + containerName
+	if runtime, ok := pod.Annotations[annotationKey]; ok {
+		return runtime
+	}
+
+	// Default based on container index
+	if containerIndex == 0 {
+		return resource.MacOSRuntime
+	}
+	return resource.ContainerRuntime
 }

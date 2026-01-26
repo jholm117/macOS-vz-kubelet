@@ -83,3 +83,23 @@ func (d *VirtualMachineData) incrementCounter() {
 func (d *VirtualMachineData) decrementCounter() {
 	atomic.AddInt32(&d.counter, -1)
 }
+
+// SetVPCIPAddress sets the VPC IP address for a specific pod's VM.
+// Returns true if the VM was found and updated, false otherwise.
+func (d *VirtualMachineData) SetVPCIPAddress(podNamespace, podName, vpcIP string) bool {
+	_, ok := d.UpdateVirtualMachineInfo(podNamespace, podName, func(info VirtualMachineInfo) VirtualMachineInfo {
+		info.VPCIPAddress = vpcIP
+		return info
+	})
+	return ok
+}
+
+// GetVPCIPAddress returns the VPC IP address for a specific pod's VM.
+// Returns empty string if no VPC IP is set.
+func (d *VirtualMachineData) GetVPCIPAddress(podNamespace, podName string) string {
+	info, ok := d.GetVirtualMachineInfo(podNamespace, podName)
+	if !ok {
+		return ""
+	}
+	return info.VPCIPAddress
+}

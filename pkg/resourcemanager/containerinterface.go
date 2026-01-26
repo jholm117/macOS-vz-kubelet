@@ -14,6 +14,18 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// HostProcessParams contains the parameters needed to create a host process.
+type HostProcessParams struct {
+	PodNamespace string
+	PodName      string
+	Name         string
+	Command      []string
+	Args         []string
+	Env          []corev1.EnvVar
+	WorkingDir   string
+	Mounts       []volumes.Mount
+}
+
 // ContainerParams is a struct that contains the parameters needed to create a container.
 type ContainerParams struct {
 	PodNamespace, PodName string
@@ -46,4 +58,17 @@ type ContainersClient interface {
 	AttachToContainer(ctx context.Context, namespace, name, containerName string, attach api.AttachIO) error
 	IsContainerPresent(ctx context.Context, podNs, podName, containerName string) bool
 	GetContainerStats(ctx context.Context, podNs, podName string, containerName string) (stats.ContainerStats, error)
+}
+
+// HostProcessClient is an interface for managing native host processes as pods.
+// This enables running macOS binaries directly on the host (e.g., CNI agents, DaemonSets).
+type HostProcessClient interface {
+	CreateProcess(ctx context.Context, params HostProcessParams) error
+	RemoveProcesses(ctx context.Context, podNs, podName string, gracePeriod int64) error
+	GetProcesses(ctx context.Context, podNs, podName string) ([]resource.Process, error)
+	GetProcessesListResult(ctx context.Context) (map[types.NamespacedName][]resource.Process, error)
+	GetProcessLogs(ctx context.Context, namespace, podName, processName string, opts api.ContainerLogOpts) (io.ReadCloser, error)
+	ExecInProcess(ctx context.Context, namespace, podName, processName string, cmd []string, attach api.AttachIO) error
+	IsProcessPresent(ctx context.Context, podNs, podName, processName string) bool
+	GetProcessStats(ctx context.Context, podNs, podName, processName string) (stats.ContainerStats, error)
 }
